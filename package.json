@@ -1,6 +1,6 @@
 {
   "name": "ci-why",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Analyzes CI build logs and explains failures in plain English",
   "main": "dist/index.js",
   "bin": {
@@ -16,12 +16,19 @@
     "dev": "ts-node src/index.ts",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["ci", "build", "log", "analyzer", "claude", "ai"],
+  "keywords": [
+    "ci",
+    "build",
+    "log",
+    "analyzer",
+    "claude",
+    "ai"
+  ],
   "author": "ciwhy-tool",
   "license": "ISC",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ciwhy-tool/ci-why.git"
+    "url": "git+https://github.com/ciwhy-tool/ci-why.git"
   },
   "homepage": "https://github.com/ciwhy-tool/ci-why#readme",
   "bugs": {
