@@ -22,25 +22,82 @@ const c = {
   dim:    (s: string) => `\x1b[2m${s}\x1b[0m`,
 };
 
+// ─── Argument parsing ─────────────────────────────────────────────────────────
+
+type LogFormat = "auto" | "jest" | "pytest" | "go" | "rust" | "maven";
+
+interface ParsedArgs {
+  command:  string | undefined;
+  filePath: string | undefined;
+  jsonMode: boolean;
+  format:   LogFormat;
+  help:     boolean;
+  version:  boolean;
+}
+
+function parseArgs(argv: string[]): ParsedArgs {
+  let command:  string | undefined;
+  let filePath: string | undefined;
+  let jsonMode  = false;
+  let format: LogFormat = "auto";
+  let help    = false;
+  let ver     = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--json")                          { jsonMode = true; }
+    else if (arg === "--help"  || arg === "-h")    { help = true; }
+    else if (arg === "--version" || arg === "-v")  { ver = true; }
+    else if (arg === "--format" && argv[i + 1])    { format = argv[++i] as LogFormat; }
+    else if (!arg.startsWith("-")) {
+      // First bare word is a subcommand (setup), subsequent ones are file paths
+      if (!command && !filePath) {
+        if (arg === "setup") command = arg;
+        else filePath = arg;
+      }
+    }
+  }
+
+  return { command, filePath, jsonMode, format, help, version: ver };
+}
+
+// ─── Log format detection & chunking ─────────────────────────────────────────
+
+const FORMAT_PATTERNS: Record<Exclude<LogFormat, "auto">, RegExp> = {
+  jest:   /error|failed|exception|fatal|panic|●|✕/i,
+  pytest: /FAILED|AssertionError|traceback|\bE\s+\w/i,
+  go:     /FAIL|panic:|--- FAIL/i,
+  rust:   /error\[E\d+\]|panicked|^FAILED|^error:/i,
+  maven:  /BUILD FAILURE|BUILD FAILED|\[ERROR\]|\[FATAL\]|Exception/i,
+};
+
+function detectFormat(text: string): Exclude<LogFormat, "auto"> {
+  if (/error\[E\d+\]|thread '.*' panicked/.test(text))       return "rust";
+  if (/^--- FAIL:|^panic:/m.test(text))                       return "go";
+  if (/^FAILED .+::|AssertionError|^={20,}/m.test(text))     return "pytest";
+  if (/BUILD FAILURE|BUILD FAILED|\[ERROR\]|\[FATAL\]/.test(text)) return "maven";
+  return "jest";
+}
+
 function stripAnsi(text: string): string {
   // eslint-disable-next-line no-control-regex
   return text.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
 }
 
-function chunkLog(text: string): string {
-  const lines = text.split("\n");
+function chunkLog(text: string, format: Exclude<LogFormat, "auto">): string {
+  const lines   = text.split("\n");
+  const pattern = FORMAT_PATTERNS[format];
 
-  const errorPattern = /error|failed|exception|fatal|panic|traceback/i;
-  const errorLines: string[] = [];
+  const signalLines: string[] = [];
   for (const line of lines) {
-    if (errorPattern.test(line)) errorLines.push(line);
+    if (pattern.test(line)) signalLines.push(line);
   }
 
   const tail = lines.slice(-200);
 
-  const seen = new Set<string>();
+  const seen   = new Set<string>();
   const result: string[] = [];
-  for (const line of [...errorLines, ...tail]) {
+  for (const line of [...signalLines, ...tail]) {
     if (!seen.has(line)) {
       seen.add(line);
       result.push(line);
@@ -50,28 +107,51 @@ function chunkLog(text: string): string {
   return result.join("\n");
 }
 
-async function readInput(): Promise<string> {
-  const args = process.argv.slice(2);
+// ─── Input ────────────────────────────────────────────────────────────────────
 
-  if (args.length > 0 && !args[0].startsWith("-")) {
-    const filePath = path.resolve(args[0]);
-    if (!fs.existsSync(filePath)) {
-      console.error(c.red(`Error: file not found: ${filePath}`));
+async function readInput(filePath?: string): Promise<string> {
+  if (filePath) {
+    const resolved = path.resolve(filePath);
+    if (!fs.existsSync(resolved)) {
+      console.error(c.red(`Error: file not found: ${resolved}`));
       process.exit(1);
     }
-    return fs.readFileSync(filePath, "utf8");
+    return fs.readFileSync(resolved, "utf8");
   }
 
   return new Promise((resolve, reject) => {
     let data = "";
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk) => (data += chunk));
-    process.stdin.on("end", () => resolve(data));
+    process.stdin.on("end",  () => resolve(data));
     process.stdin.on("error", reject);
   });
 }
 
-async function analyzeLog(log: string): Promise<void> {
+// ─── Analysis ─────────────────────────────────────────────────────────────────
+
+const MODEL = "claude-haiku-4-5-20251001";
+
+interface AnalysisResult {
+  why:          string;
+  failingLine:  string;
+  suggestedFix: string;
+  linesAnalyzed: number;
+  model:        string;
+}
+
+function parseResponse(text: string): Omit<AnalysisResult, "linesAnalyzed" | "model"> {
+  const why         = text.match(/WHY:\s*(.+?)(?=\nFAILING LINE:|$)/s)?.[1]?.trim() ?? "";
+  const failingLine = text.match(/FAILING LINE:\s*(.+?)(?=\nSUGGESTED FIX:|$)/s)?.[1]?.trim() ?? "";
+  const suggestedFix = text.match(/SUGGESTED FIX:\s*(.+?)$/s)?.[1]?.trim() ?? "";
+  return { why, failingLine, suggestedFix };
+}
+
+async function analyzeLog(
+  log: string,
+  linesAnalyzed: number,
+  jsonMode: boolean,
+): Promise<void> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     console.error(c.red("Error: ANTHROPIC_API_KEY is not set."));
@@ -89,18 +169,13 @@ WHY: <one clear sentence explaining the root cause of the failure>
 FAILING LINE: <the exact line, command, or file reference that caused it>
 SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
 
-  process.stderr.write(c.dim("Analyzing build log…\n\n"));
+  if (!jsonMode) process.stderr.write(c.dim("Analyzing build log…\n\n"));
 
   const response = await client.messages.create({
-    model: "claude-haiku-4-5-20251001",
+    model: MODEL,
     max_tokens: 1024,
     system: systemPrompt,
-    messages: [
-      {
-        role: "user",
-        content: `Here is the CI build log to analyze:\n\n${log}`,
-      },
-    ],
+    messages: [{ role: "user", content: `Here is the CI build log to analyze:\n\n${log}` }],
   });
 
   const text = response.content
@@ -108,38 +183,31 @@ SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
     .map((block) => block.text)
     .join("");
 
-  displayResult(text);
+  if (jsonMode) {
+    const result: AnalysisResult = {
+      ...parseResponse(text),
+      linesAnalyzed,
+      model: MODEL,
+    };
+    console.log(JSON.stringify(result, null, 2));
+  } else {
+    displayResult(text);
+  }
 }
 
 function displayResult(text: string): void {
-  const whyMatch     = text.match(/WHY:\s*(.+?)(?=\nFAILING LINE:|$)/s);
-  const failingMatch = text.match(/FAILING LINE:\s*(.+?)(?=\nSUGGESTED FIX:|$)/s);
-  const fixMatch     = text.match(/SUGGESTED FIX:\s*(.+?)$/s);
-
+  const { why, failingLine, suggestedFix } = parseResponse(text);
   const divider = c.dim("─".repeat(50));
 
   console.log(divider);
 
-  if (whyMatch) {
-    console.log(c.bold(c.red("  WHY")));
-    console.log(`  ${whyMatch[1].trim()}\n`);
-  }
-
-  if (failingMatch) {
-    console.log(c.bold(c.yellow("  FAILING LINE")));
-    console.log(`  ${failingMatch[1].trim()}\n`);
-  }
-
-  if (fixMatch) {
-    console.log(c.bold(c.green("  SUGGESTED FIX")));
-    console.log(`  ${fixMatch[1].trim()}\n`);
-  }
+  if (why)          { console.log(c.bold(c.red("  WHY")));           console.log(`  ${why}\n`); }
+  if (failingLine)  { console.log(c.bold(c.yellow("  FAILING LINE"))); console.log(`  ${failingLine}\n`); }
+  if (suggestedFix) { console.log(c.bold(c.green("  SUGGESTED FIX"))); console.log(`  ${suggestedFix}\n`); }
 
   console.log(divider);
 
-  if (!whyMatch && !failingMatch && !fixMatch) {
-    console.log(text);
-  }
+  if (!why && !failingLine && !suggestedFix) console.log(text);
 }
 
 // ─── Setup wizard ─────────────────────────────────────────────────────────────
@@ -147,10 +215,7 @@ function displayResult(text: string): void {
 function promptLine(question: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer.trim());
-    });
+    rl.question(question, (answer) => { rl.close(); resolve(answer.trim()); });
   });
 }
 
@@ -163,7 +228,7 @@ async function promptForKey(): Promise<string> {
 }
 
 function saveKey(apiKey: string): void {
-  const configDir = path.join(os.homedir(), ".config", "ci-why");
+  const configDir  = path.join(os.homedir(), ".config", "ci-why");
   fs.mkdirSync(configDir, { recursive: true });
   const configPath = path.join(configDir, ".env");
   fs.writeFileSync(configPath, `ANTHROPIC_API_KEY=${apiKey}\n`, "utf8");
@@ -192,7 +257,7 @@ async function testKey(apiKey: string): Promise<void> {
   try {
     const client = new Anthropic({ apiKey });
     await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
+      model: MODEL,
       max_tokens: 1,
       messages: [{ role: "user", content: "hi" }],
     });
@@ -224,40 +289,38 @@ async function setup(): Promise<void> {
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const args = process.argv.slice(2);
+  const args = parseArgs(process.argv.slice(2));
 
-  if (args[0] === "setup") {
-    await setup();
-    process.exit(0);
-  }
+  if (args.command === "setup") { await setup(); process.exit(0); }
 
-  if (args.includes("--version") || args.includes("-v")) {
-    console.log(version);
-    process.exit(0);
-  }
+  if (args.version) { console.log(version); process.exit(0); }
 
-  if (args.includes("--help") || args.includes("-h")) {
+  if (args.help) {
     console.log(`ci-why v${version} — explain CI build failures in plain English`);
     console.log("");
     console.log("First time? Run: ci-why setup");
     console.log("");
     console.log("Usage:");
-    console.log("  cat build.log | ci-why       # pipe a log through stdin");
-    console.log("  ci-why ./build.log           # analyze a log file");
+    console.log("  cat build.log | ci-why              # pipe a log through stdin");
+    console.log("  ci-why ./build.log                  # analyze a log file");
+    console.log("  ci-why --json ./build.log            # output results as JSON");
+    console.log("  ci-why --format pytest ./build.log  # specify log format");
     console.log("");
     console.log("Commands:");
     console.log("  ci-why setup        Configure your Anthropic API key");
     console.log("");
     console.log("Options:");
-    console.log("  --help, -h      Show this help message");
-    console.log("  --version, -v   Print the version number");
+    console.log("  --json              Output results as JSON instead of coloured text");
+    console.log("  --format <fmt>      Log format: auto (default), jest, pytest, go, rust, maven");
+    console.log("  --help,    -h       Show this help message");
+    console.log("  --version, -v       Print the version number");
     console.log("");
     console.log("Environment:");
     console.log("  ANTHROPIC_API_KEY   Required. Get yours at console.anthropic.com");
     process.exit(0);
   }
 
-  const rawLog = await readInput();
+  const rawLog = await readInput(args.filePath);
 
   if (!rawLog.trim()) {
     console.error(c.red("Error: no log content provided."));
@@ -265,7 +328,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const cleanLog = stripAnsi(rawLog);
+  const cleanLog  = stripAnsi(rawLog);
   const lineCount = cleanLog.split("\n").filter((l) => l.trim()).length;
 
   if (lineCount < 10) {
@@ -273,8 +336,11 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const chunkedLog = chunkLog(cleanLog);
-  await analyzeLog(chunkedLog);
+  const resolvedFormat = args.format === "auto" ? detectFormat(cleanLog) : args.format;
+  const chunkedLog     = chunkLog(cleanLog, resolvedFormat);
+  const linesAnalyzed  = chunkedLog.split("\n").filter((l) => l.trim()).length;
+
+  await analyzeLog(chunkedLog, linesAnalyzed, args.jsonMode);
 }
 
 main().catch((err: Error) => {

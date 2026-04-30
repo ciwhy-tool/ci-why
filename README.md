@@ -14,13 +14,17 @@ npm install -g ci-why
 
 ## Setup
 
-`ci-why` uses the [Anthropic API](https://console.anthropic.com/) to analyze logs. Set your API key:
+```bash
+ci-why setup
+```
+
+This walks you through getting a free Anthropic API key and saves it automatically.
+
+Or set it manually:
 
 ```bash
 export ANTHROPIC_API_KEY=your-key-here
 ```
-
-To make this permanent, add it to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.).
 
 ---
 
@@ -65,6 +69,40 @@ gh run view --log-failed | ci-why
 
 ---
 
+## JSON output
+
+Add `--json` to get machine-readable output — useful for piping into other tools or scripts:
+
+```bash
+ci-why --json ./build.log
+```
+
+```json
+{
+  "why": "The auth service returns null for the token field instead of a valid token string",
+  "failingLine": "src/services/auth.test.ts:63 — expect(result.token.substring(0, 3)).toBe('abc')",
+  "suggestedFix": "Check authService.login() to ensure it returns a valid token from the API response",
+  "linesAnalyzed": 312,
+  "model": "claude-haiku-4-5-20251001"
+}
+```
+
+---
+
+## Supported log formats
+
+`ci-why` auto-detects the log format and prioritises the most relevant lines before sending to Claude. You can also specify a format manually with `--format`.
+
+| Format | Auto-detected from | Example |
+|---|---|---|
+| `jest` (default) | Jest/Node output | `cat jest.log \| ci-why` |
+| `pytest` | `FAILED`, `AssertionError`, traceback blocks | `ci-why --format pytest ./pytest.log` |
+| `go` | `--- FAIL:`, `panic:` | `go test ./... 2>&1 \| ci-why` |
+| `rust` | `error[E0xxx]`, `thread 'main' panicked` | `cargo test 2>&1 \| ci-why` |
+| `maven` | `BUILD FAILURE`, `[ERROR]`, `[FATAL]` | `ci-why --format maven ./maven.log` |
+
+---
+
 ## GitHub Actions integration
 
 Add `ci-why` to any existing workflow to automatically post a plain-English explanation of build failures as a PR comment.
@@ -101,15 +139,6 @@ steps:
 |---|---|
 | `ANTHROPIC_API_KEY` | Add in your repo → Settings → Secrets and variables → Actions |
 | `GITHUB_TOKEN` | Provided automatically by GitHub — no setup needed |
-
-When a PR build fails, ci-why posts a comment like this:
-
-> **ci-why: build failure analysis**
-> ```
-> ──────────────────────────────────────────────────
->   WHY
->   ...
-> ```
 
 ---
 
