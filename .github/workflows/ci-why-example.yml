@@ -1,0 +1,50 @@
+# Example: add ci-why to your GitHub Actions workflow
+#
+# When a pull request build fails, ci-why automatically posts an AI-generated
+# explanation of the failure as a PR comment.
+#
+# Required secrets:
+#   ANTHROPIC_API_KEY  — your Anthropic key from console.anthropic.com
+#   GITHUB_TOKEN       — provided automatically by GitHub Actions (no setup needed)
+
+name: CI
+
+on:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Capture all build output to a log file so ci-why can read it.
+      # `continue-on-error: true` lets the workflow keep running even when the
+      # build fails so we can analyse the log and post the comment.
+      - name: Build and test
+        id: build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          { npm ci && npm run build && npm test; } 2>&1 | tee /tmp/build.log
+
+      # Only runs when the build step above failed.
+      - name: Explain failure with ci-why
+        if: steps.build.outcome == 'failure'
+        uses: ciwhy-tool/ci-why@v0.2.0
+        with:
+          log-file: /tmp/build.log
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ github.event.pull_request.number }}
+
+      # Re-fail the job after posting the comment so the PR is correctly marked red.
+      - name: Fail the job
+        if: steps.build.outcome == 'failure'
+        run: exit 1

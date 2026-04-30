@@ -65,6 +65,54 @@ gh run view --log-failed | ci-why
 
 ---
 
+## GitHub Actions integration
+
+Add `ci-why` to any existing workflow to automatically post a plain-English explanation of build failures as a PR comment.
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+
+  - name: Build and test
+    id: build
+    continue-on-error: true
+    shell: bash
+    run: |
+      set -o pipefail
+      { npm ci && npm run build && npm test; } 2>&1 | tee /tmp/build.log
+
+  - name: Explain failure with ci-why
+    if: steps.build.outcome == 'failure'
+    uses: ciwhy-tool/ci-why@v0.2.0
+    with:
+      log-file: /tmp/build.log
+      anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+      github-token: ${{ secrets.GITHUB_TOKEN }}
+      pr-number: ${{ github.event.pull_request.number }}
+
+  - name: Fail the job
+    if: steps.build.outcome == 'failure'
+    run: exit 1
+```
+
+**Required secrets:**
+
+| Secret | How to set it |
+|---|---|
+| `ANTHROPIC_API_KEY` | Add in your repo → Settings → Secrets and variables → Actions |
+| `GITHUB_TOKEN` | Provided automatically by GitHub — no setup needed |
+
+When a PR build fails, ci-why posts a comment like this:
+
+> **ci-why: build failure analysis**
+> ```
+> ──────────────────────────────────────────────────
+>   WHY
+>   ...
+> ```
+
+---
+
 ## Requirements
 
 - Node.js >= 18
