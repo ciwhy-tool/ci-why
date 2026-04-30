@@ -1,16 +1,12 @@
 #!/usr/bin/env node
 
-// Load environment variables from a .env file (e.g. ANTHROPIC_API_KEY=...)
-// dotenv.config() reads the .env file in the current working directory
 import "dotenv/config";
 
 import Anthropic from "@anthropic-ai/sdk";
 import * as fs from "fs";
 import * as path from "path";
+import { version } from "../package.json";
 
-// ─── Terminal colour helpers ───────────────────────────────────────────────
-// These use standard ANSI escape codes supported by every modern terminal.
-// \x1b[<code>m  = start colour    \x1b[0m = reset to default
 const c = {
   bold:   (s: string) => `\x1b[1m${s}\x1b[0m`,
   red:    (s: string) => `\x1b[31m${s}\x1b[0m`,
@@ -19,36 +15,22 @@ const c = {
   dim:    (s: string) => `\x1b[2m${s}\x1b[0m`,
 };
 
-// ─── Step 1: Strip ANSI escape codes from the raw log ─────────────────────
-// CI logs are often full of colour codes like "\x1b[32mOK\x1b[0m".
-// This regex matches the standard ANSI CSI (Control Sequence Introducer)
-// patterns and removes them so Claude only sees plain text.
 function stripAnsi(text: string): string {
   // eslint-disable-next-line no-control-regex
   return text.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "");
 }
 
-// ─── Step 2: Chunk the log down to the most useful parts ──────────────────
-// Full CI logs can be megabytes long. We extract:
-//   • Every line that mentions an error, failure, or exception (top context)
-//   • The last 200 lines (where the build usually falls over)
-// Duplicates are removed so we don't send the same line twice.
 function chunkLog(text: string): string {
   const lines = text.split("\n");
 
-  // Collect lines that look like errors/failures
   const errorPattern = /error|failed|exception|fatal|panic|traceback/i;
   const errorLines: string[] = [];
   for (const line of lines) {
-    if (errorPattern.test(line)) {
-      errorLines.push(line);
-    }
+    if (errorPattern.test(line)) errorLines.push(line);
   }
 
-  // Take the last 200 lines
   const tail = lines.slice(-200);
 
-  // Merge error lines + tail, keeping insertion order and removing dupes
   const seen = new Set<string>();
   const result: string[] = [];
   for (const line of [...errorLines, ...tail]) {
@@ -61,24 +43,18 @@ function chunkLog(text: string): string {
   return result.join("\n");
 }
 
-// ─── Step 3: Read the log from a file path or stdin ───────────────────────
-// Usage:
-//   ci-why ./build.log          ← pass a file path as the first argument
-//   cat build.log | ci-why      ← pipe the log through stdin
 async function readInput(): Promise<string> {
   const args = process.argv.slice(2);
 
   if (args.length > 0 && !args[0].startsWith("-")) {
-    // A file path was given — read it directly
     const filePath = path.resolve(args[0]);
     if (!fs.existsSync(filePath)) {
-      console.error(`Error: file not found: ${filePath}`);
+      console.error(c.red(`Error: file not found: ${filePath}`));
       process.exit(1);
     }
     return fs.readFileSync(filePath, "utf8");
   }
 
-  // No file path — read from stdin (supports piping)
   return new Promise((resolve, reject) => {
     let data = "";
     process.stdin.setEncoding("utf8");
@@ -88,21 +64,17 @@ async function readInput(): Promise<string> {
   });
 }
 
-// ─── Step 4: Send the log to Claude and get an analysis ───────────────────
-// We use the claude-haiku-4-5 model — it's fast and cheap, perfect for
-// parsing build logs. The system prompt tells Claude exactly what format
-// to respond in so we can reliably parse WHY / FAILING LINE / SUGGESTED FIX.
 async function analyzeLog(log: string): Promise<void> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     console.error(c.red("Error: ANTHROPIC_API_KEY is not set."));
-    console.error("Copy .env.example to .env and add your Anthropic API key.");
+    console.error("Get your free key at console.anthropic.com then run:");
+    console.error("  export ANTHROPIC_API_KEY=your-key-here");
     process.exit(1);
   }
 
   const client = new Anthropic({ apiKey });
 
-  // The system prompt locks Claude into a structured format that we can parse.
   const systemPrompt = `You are a CI/CD build failure analyst. Given a build log, respond ONLY in this exact format — no extra commentary:
 
 WHY: <one clear sentence explaining the root cause of the failure>
@@ -111,7 +83,6 @@ SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
 
   process.stderr.write(c.dim("Analyzing build log…\n\n"));
 
-  // Call the Anthropic Messages API
   const response = await client.messages.create({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 1024,
@@ -124,8 +95,6 @@ SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
     ],
   });
 
-  // Extract the text content from the response
-  // response.content is an array of content blocks; we only need text blocks.
   const text = response.content
     .filter((block): block is Anthropic.TextBlock => block.type === "text")
     .map((block) => block.text)
@@ -134,11 +103,7 @@ SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
   displayResult(text);
 }
 
-// ─── Step 5: Pretty-print the result with colours ─────────────────────────
-// Claude responds with three clearly-labelled sections.
-// We parse each one with a regex and print it with colour.
 function displayResult(text: string): void {
-  // Each section starts with the label and runs until the next label or end
   const whyMatch     = text.match(/WHY:\s*(.+?)(?=\nFAILING LINE:|$)/s);
   const failingMatch = text.match(/FAILING LINE:\s*(.+?)(?=\nSUGGESTED FIX:|$)/s);
   const fixMatch     = text.match(/SUGGESTED FIX:\s*(.+?)$/s);
@@ -164,18 +129,32 @@ function displayResult(text: string): void {
 
   console.log(divider);
 
-  // Fallback: if none of the sections parsed, just print the raw response
   if (!whyMatch && !failingMatch && !fixMatch) {
     console.log(text);
   }
 }
 
-// ─── Entry point ──────────────────────────────────────────────────────────
 async function main(): Promise<void> {
-  if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  const args = process.argv.slice(2);
+
+  if (args.includes("--version") || args.includes("-v")) {
+    console.log(version);
+    process.exit(0);
+  }
+
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log(`ci-why v${version} — explain CI build failures in plain English`);
+    console.log("");
     console.log("Usage:");
-    console.log("  ci-why ./build.log        # analyze a log file");
-    console.log("  cat build.log | ci-why    # pipe a log through stdin");
+    console.log("  cat build.log | ci-why       # pipe a log through stdin");
+    console.log("  ci-why ./build.log           # analyze a log file");
+    console.log("");
+    console.log("Options:");
+    console.log("  --help, -h      Show this help message");
+    console.log("  --version, -v   Print the version number");
+    console.log("");
+    console.log("Environment:");
+    console.log("  ANTHROPIC_API_KEY   Required. Get yours at console.anthropic.com");
     process.exit(0);
   }
 
@@ -187,14 +166,18 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Clean and reduce the log before sending to Claude
-  const cleanLog   = stripAnsi(rawLog);
-  const chunkedLog = chunkLog(cleanLog);
+  const cleanLog = stripAnsi(rawLog);
+  const lineCount = cleanLog.split("\n").filter((l) => l.trim()).length;
 
+  if (lineCount < 10) {
+    console.error(c.red("Error: Log seems too short to analyse. Make sure you're piping a real CI log."));
+    process.exit(1);
+  }
+
+  const chunkedLog = chunkLog(cleanLog);
   await analyzeLog(chunkedLog);
 }
 
-// Run and handle top-level errors
 main().catch((err: Error) => {
   console.error(c.red(`Error: ${err.message}`));
   process.exit(1);
