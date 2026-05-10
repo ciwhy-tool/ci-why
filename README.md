@@ -103,6 +103,45 @@ ci-why --json ./build.log
 
 ---
 
+## Auto-fix suggestions
+
+`ci-why fix` does everything the normal analysis does, then reads the failing source file and asks Claude to produce a patch.
+
+```bash
+ci-why fix ./build.log
+cat build.log | ci-why fix
+```
+
+Example output:
+
+```
+──────────────────────────────────────────────────
+  SUGGESTED PATCH
+  src/services/auth.ts  line 47
+──────────────────────────────────────────────────
+--- a/src/services/auth.ts
++++ b/src/services/auth.ts
+@@ -45,3 +45,3 @@
+ const payload = { userId: user.id };
+-return { token: null, expiresIn: 0 };
++return { token: jwt.sign(payload, secret), expiresIn: 3600 };
+──────────────────────────────────────────────────
+Apply this patch? (y/n)
+```
+
+- **y** — applies the patch directly to the file
+- **n** — saves a `ci-why-fix-<id>.patch` file you can apply manually
+
+**Preview without applying:**
+
+```bash
+ci-why fix --dry-run ./build.log
+```
+
+> The patch is AI-generated and should always be reviewed before applying. Run your tests after applying to confirm the fix is correct.
+
+---
+
 ## Failure history
 
 Every analysis is automatically saved to `~/.config/ci-why/history.json`.

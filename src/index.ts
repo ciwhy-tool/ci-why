@@ -38,6 +38,7 @@ interface ParsedArgs {
   showId:       string | undefined;
   clearHistory: boolean;
   noNotify:     boolean;
+  dryRun:       boolean;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -51,6 +52,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   let showId:       string | undefined;
   let clearHistory  = false;
   let noNotify      = false;
+  let dryRun        = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -61,9 +63,10 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === "--show"   && argv[i + 1])    { showId = argv[++i]; }
     else if (arg === "--clear")                    { clearHistory = true; }
     else if (arg === "--no-notify")                { noNotify = true; }
+    else if (arg === "--dry-run")                  { dryRun = true; }
     else if (!arg.startsWith("-")) {
       if (!command) {
-        if (arg === "setup" || arg === "history" || arg === "notify") command = arg;
+        if (arg === "setup" || arg === "history" || arg === "notify" || arg === "fix") command = arg;
         else filePath = arg;
       } else if (!subCommand && !filePath) {
         if (command === "notify" && (arg === "setup" || arg === "test" || arg === "clear")) {
@@ -75,7 +78,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
 
-  return { command, subCommand, filePath, jsonMode, format, help, version: ver, showId, clearHistory, noNotify };
+  return { command, subCommand, filePath, jsonMode, format, help, version: ver, showId, clearHistory, noNotify, dryRun };
 }
 
 // ─── Config file helpers ──────────────────────────────────────────────────────
@@ -389,6 +392,12 @@ async function readInput(filePath?: string): Promise<string> {
 
 const MODEL = "claude-haiku-4-5-20251001";
 
+const ANALYSIS_SYSTEM_PROMPT = `You are a CI/CD build failure analyst. Given a build log, respond ONLY in this exact format — no extra commentary:
+
+WHY: <one clear sentence explaining the root cause of the failure>
+FAILING LINE: <the exact line, command, or file reference that caused it>
+SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
+
 interface AnalysisResult {
   why:           string;
   failingLine:   string;
@@ -402,6 +411,21 @@ function parseResponse(text: string): Omit<AnalysisResult, "linesAnalyzed" | "mo
   const failingLine  = text.match(/FAILING LINE:\s*(.+?)(?=\nSUGGESTED FIX:|$)/s)?.[1]?.trim() ?? "";
   const suggestedFix = text.match(/SUGGESTED FIX:\s*(.+?)$/s)?.[1]?.trim() ?? "";
   return { why, failingLine, suggestedFix };
+}
+
+function displayResult(text: string): void {
+  const { why, failingLine, suggestedFix } = parseResponse(text);
+  const divider = c.dim("─".repeat(50));
+
+  console.log(divider);
+
+  if (why)          { console.log(c.bold(c.red("  WHY")));            console.log(`  ${why}\n`); }
+  if (failingLine)  { console.log(c.bold(c.yellow("  FAILING LINE"))); console.log(`  ${failingLine}\n`); }
+  if (suggestedFix) { console.log(c.bold(c.green("  SUGGESTED FIX"))); console.log(`  ${suggestedFix}\n`); }
+
+  console.log(divider);
+
+  if (!why && !failingLine && !suggestedFix) console.log(text);
 }
 
 async function analyzeLog(
@@ -422,18 +446,12 @@ async function analyzeLog(
 
   const client = new Anthropic({ apiKey });
 
-  const systemPrompt = `You are a CI/CD build failure analyst. Given a build log, respond ONLY in this exact format — no extra commentary:
-
-WHY: <one clear sentence explaining the root cause of the failure>
-FAILING LINE: <the exact line, command, or file reference that caused it>
-SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
-
   if (!jsonMode) process.stderr.write(c.dim("Analyzing build log…\n\n"));
 
   const response = await client.messages.create({
     model: MODEL,
     max_tokens: 1024,
-    system: systemPrompt,
+    system: ANALYSIS_SYSTEM_PROMPT,
     messages: [{ role: "user", content: `Here is the CI build log to analyze:\n\n${log}` }],
   });
 
@@ -444,7 +462,6 @@ SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
 
   const parsed = parseResponse(text);
 
-  // Save to history
   const entry: HistoryEntry = {
     id: generateId(),
     date: new Date().toISOString(),
@@ -460,7 +477,6 @@ SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
   } else {
     displayResult(text);
 
-    // Flaky test warning
     if (parsed.failingLine) {
       const count = history.filter((e) => e.failingLine === parsed.failingLine).length;
       if (count >= 3) {
@@ -469,7 +485,6 @@ SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
     }
   }
 
-  // Slack notification
   const webhookUrl = process.env.SLACK_WEBHOOK_URL;
   if (!noNotify && webhookUrl) {
     try {
@@ -482,19 +497,175 @@ SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
   }
 }
 
-function displayResult(text: string): void {
-  const { why, failingLine, suggestedFix } = parseResponse(text);
+// ─── Fix command ──────────────────────────────────────────────────────────────
+
+const PATCH_SYSTEM_PROMPT = `You are a code patch generator. Given a CI build error and the contents of the failing source file, produce a minimal fix.
+
+Respond in EXACTLY this format — no extra text before or after:
+
+FILE: <relative file path>
+LINE: <line number of the primary change>
+DISPLAY:
+--- a/<file path>
++++ b/<file path>
+@@ -<n>,<count> +<n>,<count> @@
+ <context line>
+-<old line>
++<new line>
+ <context line>
+APPLY_OLD:
+<exact text to find in the file — must match verbatim including whitespace>
+APPLY_NEW:
+<exact replacement text>`;
+
+interface PatchResult {
+  file:     string;
+  line:     string;
+  display:  string;
+  applyOld: string;
+  applyNew: string;
+}
+
+function parsePatchResponse(text: string): PatchResult | null {
+  const file     = text.match(/^FILE:\s*(.+)$/m)?.[1]?.trim();
+  const line     = text.match(/^LINE:\s*(.+)$/m)?.[1]?.trim();
+  const display  = text.match(/DISPLAY:\n([\s\S]+?)(?=\nAPPLY_OLD:)/)?.[1]?.trim();
+  const applyOld = text.match(/APPLY_OLD:\n([\s\S]+?)(?=\nAPPLY_NEW:)/)?.[1];
+  const applyNew = text.match(/APPLY_NEW:\n([\s\S]+?)$/)?.[1];
+  if (!file || !display) return null;
+  return { file, line: line ?? "?", display, applyOld: applyOld ?? "", applyNew: applyNew ?? "" };
+}
+
+function extractFilePath(text: string): string | undefined {
+  const match = text.match(/([./][\w./\-]+\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|cpp|c|h))/i);
+  return match?.[1];
+}
+
+function displayPatch(patch: PatchResult): void {
   const divider = c.dim("─".repeat(50));
-
   console.log(divider);
-
-  if (why)          { console.log(c.bold(c.red("  WHY")));            console.log(`  ${why}\n`); }
-  if (failingLine)  { console.log(c.bold(c.yellow("  FAILING LINE"))); console.log(`  ${failingLine}\n`); }
-  if (suggestedFix) { console.log(c.bold(c.green("  SUGGESTED FIX"))); console.log(`  ${suggestedFix}\n`); }
-
+  console.log(c.bold("  SUGGESTED PATCH"));
+  console.log(c.dim(`  ${patch.file}  line ${patch.line}`));
   console.log(divider);
+  for (const ln of patch.display.split("\n")) {
+    if (ln.startsWith("-") && !ln.startsWith("---"))      console.log(c.red(ln));
+    else if (ln.startsWith("+") && !ln.startsWith("+++")) console.log(c.green(ln));
+    else                                                   console.log(c.dim(ln));
+  }
+  console.log(divider);
+}
 
-  if (!why && !failingLine && !suggestedFix) console.log(text);
+function savePatchFile(display: string, id: string): string {
+  const filename = `ci-why-fix-${id}.patch`;
+  fs.writeFileSync(path.join(process.cwd(), filename), display + "\n", "utf8");
+  return filename;
+}
+
+async function fixCommand(
+  log: string,
+  linesAnalyzed: number,
+  resolvedFormat: string,
+  dryRun: boolean,
+): Promise<void> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    console.error(c.red("Error: ANTHROPIC_API_KEY is not set."));
+    console.error("Run: ci-why setup");
+    process.exit(1);
+  }
+
+  const client = new Anthropic({ apiKey });
+
+  // Step 1: Analyse the log
+  process.stderr.write(c.dim("Analyzing build log…\n\n"));
+
+  const analysisResponse = await client.messages.create({
+    model: MODEL,
+    max_tokens: 1024,
+    system: ANALYSIS_SYSTEM_PROMPT,
+    messages: [{ role: "user", content: `Here is the CI build log to analyze:\n\n${log}` }],
+  });
+
+  const analysisText = analysisResponse.content
+    .filter((b): b is Anthropic.TextBlock => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+
+  const parsed = parseResponse(analysisText);
+  displayResult(analysisText);
+
+  const id = generateId();
+  const entry: HistoryEntry = {
+    id,
+    date: new Date().toISOString(),
+    format: resolvedFormat,
+    ...parsed,
+    linesAnalyzed,
+  };
+  const history = addToHistory(entry);
+
+  if (parsed.failingLine) {
+    const count = history.filter((e) => e.failingLine === parsed.failingLine).length;
+    if (count >= 3) {
+      console.log(c.yellow(`⚠  This line has failed ${count} times recently — this may be a flaky test.`));
+    }
+  }
+
+  // Step 2: Locate the failing source file
+  const filePath = extractFilePath(parsed.failingLine) ?? extractFilePath(parsed.why);
+  if (!filePath || !fs.existsSync(path.resolve(filePath))) {
+    console.log(c.dim("\nCould not locate the source file to patch."));
+    console.log("Here is the suggested fix to apply manually:\n");
+    console.log(`  ${parsed.suggestedFix}`);
+    return;
+  }
+
+  // Step 3: Generate patch
+  process.stderr.write(c.dim("\nGenerating patch…\n\n"));
+  const fileContent = fs.readFileSync(path.resolve(filePath), "utf8");
+
+  const patchResponse = await client.messages.create({
+    model: MODEL,
+    max_tokens: 2048,
+    system: PATCH_SYSTEM_PROMPT,
+    messages: [{
+      role: "user",
+      content: `Build error analysis:\n${analysisText}\n\nFile: ${filePath}\n\`\`\`\n${fileContent}\n\`\`\``,
+    }],
+  });
+
+  const patchText = patchResponse.content
+    .filter((b): b is Anthropic.TextBlock => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+
+  const patch = parsePatchResponse(patchText);
+  if (!patch) {
+    console.log(c.dim("\nCould not generate a patch."));
+    console.log("Here is the suggested fix to apply manually:\n");
+    console.log(`  ${parsed.suggestedFix}`);
+    return;
+  }
+
+  displayPatch(patch);
+
+  if (dryRun) return;
+
+  const answer = await promptLine("Apply this patch? (y/n) ");
+  if (answer.toLowerCase() === "y") {
+    const original = fs.readFileSync(path.resolve(filePath), "utf8");
+    if (patch.applyOld && original.includes(patch.applyOld)) {
+      fs.writeFileSync(path.resolve(filePath), original.replace(patch.applyOld, patch.applyNew), "utf8");
+      console.log(c.green("Patch applied. Run your tests to verify the fix."));
+    } else {
+      console.log(c.red("Could not apply the patch automatically — the expected code was not found."));
+      const patchFile = savePatchFile(patch.display, id);
+      console.log(c.dim(`Saved as ${patchFile}`));
+    }
+  } else {
+    const patchFile = savePatchFile(patch.display, id);
+    console.log(c.dim(`${patchFile} saved to current directory.`));
+  }
 }
 
 // ─── Setup wizard ─────────────────────────────────────────────────────────────
@@ -605,12 +776,16 @@ async function main(): Promise<void> {
     console.log("Usage:");
     console.log("  cat build.log | ci-why              # pipe a log through stdin");
     console.log("  ci-why ./build.log                  # analyze a log file");
+    console.log("  ci-why fix ./build.log              # analyze and suggest a code patch");
+    console.log("  ci-why fix --dry-run ./build.log    # show patch without applying it");
     console.log("  ci-why --json ./build.log            # output results as JSON");
     console.log("  ci-why --format pytest ./build.log  # specify log format");
     console.log("  ci-why --no-notify ./build.log      # skip Slack notification");
     console.log("");
     console.log("Commands:");
     console.log("  ci-why setup                Configure your Anthropic API key");
+    console.log("  ci-why fix                  Analyse and suggest a code patch");
+    console.log("  ci-why fix --dry-run        Show patch without applying it");
     console.log("  ci-why history              Show last 10 analyzed failures");
     console.log("  ci-why history --show <id>  Show full details of a past failure");
     console.log("  ci-why history --clear      Clear all history");
@@ -623,6 +798,7 @@ async function main(): Promise<void> {
     console.log("  --json              Output results as JSON instead of coloured text");
     console.log("  --format <fmt>      Log format: auto (default), jest, pytest, go, rust, maven");
     console.log("  --no-notify         Skip Slack notification for this run");
+    console.log("  --dry-run           Show patch without applying or saving it");
     console.log("  --help,    -h       Show this help message");
     console.log("  --version, -v       Print the version number");
     console.log("");
@@ -652,7 +828,11 @@ async function main(): Promise<void> {
   const chunkedLog     = chunkLog(cleanLog, resolvedFormat);
   const linesAnalyzed  = chunkedLog.split("\n").filter((l) => l.trim()).length;
 
-  await analyzeLog(chunkedLog, linesAnalyzed, args.jsonMode, resolvedFormat, args.noNotify);
+  if (args.command === "fix") {
+    await fixCommand(chunkedLog, linesAnalyzed, resolvedFormat, args.dryRun);
+  } else {
+    await analyzeLog(chunkedLog, linesAnalyzed, args.jsonMode, resolvedFormat, args.noNotify);
+  }
 }
 
 main().catch((err: Error) => {
