@@ -142,6 +142,55 @@ ci-why fix --dry-run ./build.log
 
 ---
 
+## Flaky test detection
+
+ci-why tracks every analysis in a local history file. Over time it can identify tests that fail repeatedly but for different reasons — a strong signal of a flaky test.
+
+```bash
+ci-why flaky
+```
+
+```
+──────────────────────────────────────────────────
+  FLAKY TEST REPORT
+──────────────────────────────────────────────────
+⚠  src/services/auth.test.ts:63
+   Failed 4 times — 3 different failure reasons
+   Last seen: 2026-05-11
+   Confidence: HIGH
+
+⚠  src/api/client.test.ts:112
+   Failed 2 times — 2 different failure reasons
+   Last seen: 2026-05-10
+   Confidence: MEDIUM
+──────────────────────────────────────────────────
+2 flaky tests detected. Run ci-why history to see full details.
+```
+
+**Confidence levels:**
+
+| Level | Meaning |
+|---|---|
+| `HIGH` | Same line failed 4+ times with different reasons |
+| `MEDIUM` | Same line failed 2–3 times with different reasons |
+| `LOW` | Same line failed repeatedly with the same reason — likely a real bug, not flaky |
+
+**Filter by date:**
+
+```bash
+ci-why flaky --since 2026-05-01
+```
+
+**Machine-readable output:**
+
+```bash
+ci-why flaky --json
+```
+
+After every analysis, ci-why automatically warns you if any HIGH-confidence flaky tests are detected.
+
+---
+
 ## Failure history
 
 Every analysis is automatically saved to `~/.config/ci-why/history.json`.

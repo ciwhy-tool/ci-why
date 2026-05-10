@@ -39,6 +39,7 @@ interface ParsedArgs {
   clearHistory: boolean;
   noNotify:     boolean;
   dryRun:       boolean;
+  since:        string | undefined;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -53,6 +54,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   let clearHistory  = false;
   let noNotify      = false;
   let dryRun        = false;
+  let since:        string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -64,9 +66,10 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === "--clear")                    { clearHistory = true; }
     else if (arg === "--no-notify")                { noNotify = true; }
     else if (arg === "--dry-run")                  { dryRun = true; }
+    else if (arg === "--since"  && argv[i + 1])    { since = argv[++i]; }
     else if (!arg.startsWith("-")) {
       if (!command) {
-        if (arg === "setup" || arg === "history" || arg === "notify" || arg === "fix") command = arg;
+        if (["setup", "history", "notify", "fix", "flaky"].includes(arg)) command = arg;
         else filePath = arg;
       } else if (!subCommand && !filePath) {
         if (command === "notify" && (arg === "setup" || arg === "test" || arg === "clear")) {
@@ -78,7 +81,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
 
-  return { command, subCommand, filePath, jsonMode, format, help, version: ver, showId, clearHistory, noNotify, dryRun };
+  return { command, subCommand, filePath, jsonMode, format, help, version: ver, showId, clearHistory, noNotify, dryRun, since };
 }
 
 // ─── Config file helpers ──────────────────────────────────────────────────────
@@ -199,6 +202,94 @@ async function clearHistoryWithConfirm(): Promise<void> {
     console.log(c.green("  History cleared."));
   } else {
     console.log(c.dim("  Cancelled."));
+  }
+}
+
+// ─── Flaky test detection ─────────────────────────────────────────────────────
+
+interface FlakySummary {
+  failingLine:   string;
+  failureCount:  number;
+  uniqueReasons: number;
+  lastSeen:      string;
+  confidence:    "HIGH" | "MEDIUM" | "LOW";
+}
+
+function detectFlakyTests(history: HistoryEntry[], since?: Date): FlakySummary[] {
+  const filtered = since
+    ? history.filter((e) => new Date(e.date) >= since)
+    : history;
+
+  const grouped = new Map<string, HistoryEntry[]>();
+  for (const entry of filtered) {
+    if (!entry.failingLine) continue;
+    if (!grouped.has(entry.failingLine)) grouped.set(entry.failingLine, []);
+    grouped.get(entry.failingLine)!.push(entry);
+  }
+
+  const results: FlakySummary[] = [];
+  for (const [failingLine, entries] of grouped) {
+    if (entries.length < 2) continue;
+
+    const uniqueReasons = new Set(entries.map((e) => e.why)).size;
+    const lastSeen      = [...entries].sort((a, b) => b.date.localeCompare(a.date))[0].date;
+
+    let confidence: "HIGH" | "MEDIUM" | "LOW";
+    if (uniqueReasons > 1 && entries.length >= 4) confidence = "HIGH";
+    else if (uniqueReasons > 1)                   confidence = "MEDIUM";
+    else                                           confidence = "LOW";
+
+    results.push({ failingLine, failureCount: entries.length, uniqueReasons, lastSeen, confidence });
+  }
+
+  const order = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+  results.sort((a, b) =>
+    order[a.confidence] !== order[b.confidence]
+      ? order[a.confidence] - order[b.confidence]
+      : b.failureCount - a.failureCount,
+  );
+
+  return results;
+}
+
+function displayFlakyReport(summaries: FlakySummary[]): void {
+  const divider = c.dim("─".repeat(50));
+  console.log(divider);
+  console.log(c.bold("  FLAKY TEST REPORT"));
+  console.log(divider);
+
+  if (summaries.length === 0) {
+    console.log(c.dim("  No flaky tests detected."));
+    console.log(divider);
+    return;
+  }
+
+  for (const s of summaries) {
+    const reasonText = s.uniqueReasons === 1
+      ? "1 failure reason"
+      : `${s.uniqueReasons} different failure reasons`;
+    const confStr =
+      s.confidence === "HIGH"   ? c.red(c.bold("HIGH")) :
+      s.confidence === "MEDIUM" ? c.yellow("MEDIUM")    : c.dim("LOW");
+
+    console.log(`${c.yellow("⚠")}  ${s.failingLine}`);
+    console.log(`   Failed ${s.failureCount} times — ${reasonText}`);
+    console.log(`   Last seen: ${s.lastSeen.slice(0, 10)}`);
+    console.log(`   Confidence: ${confStr}`);
+    console.log();
+  }
+
+  console.log(divider);
+  const noun = summaries.length === 1 ? "flaky test" : "flaky tests";
+  console.log(`${c.yellow(`${summaries.length} ${noun} detected`)}. Run ci-why history to see full details.`);
+}
+
+function warnIfHighConfidenceFlaky(): void {
+  const history = loadHistory();
+  const high = detectFlakyTests(history).filter((s) => s.confidence === "HIGH");
+  if (high.length > 0) {
+    const noun = high.length === 1 ? "high-confidence flaky test" : "high-confidence flaky tests";
+    console.log(c.yellow(`\n⚠  WARNING: ci-why detected ${high.length} ${noun}. Run ci-why flaky for the full report.`));
   }
 }
 
@@ -462,27 +553,20 @@ async function analyzeLog(
 
   const parsed = parseResponse(text);
 
-  const entry: HistoryEntry = {
+  addToHistory({
     id: generateId(),
     date: new Date().toISOString(),
     format: resolvedFormat,
     ...parsed,
     linesAnalyzed,
-  };
-  const history = addToHistory(entry);
+  });
 
   if (jsonMode) {
     const result: AnalysisResult = { ...parsed, linesAnalyzed, model: MODEL };
     console.log(JSON.stringify(result, null, 2));
   } else {
     displayResult(text);
-
-    if (parsed.failingLine) {
-      const count = history.filter((e) => e.failingLine === parsed.failingLine).length;
-      if (count >= 3) {
-        console.log(c.yellow(`⚠  This line has failed ${count} times recently — this may be a flaky test.`));
-      }
-    }
+    warnIfHighConfidenceFlaky();
   }
 
   const webhookUrl = process.env.SLACK_WEBHOOK_URL;
@@ -576,7 +660,6 @@ async function fixCommand(
 
   const client = new Anthropic({ apiKey });
 
-  // Step 1: Analyse the log
   process.stderr.write(c.dim("Analyzing build log…\n\n"));
 
   const analysisResponse = await client.messages.create({
@@ -595,23 +678,9 @@ async function fixCommand(
   displayResult(analysisText);
 
   const id = generateId();
-  const entry: HistoryEntry = {
-    id,
-    date: new Date().toISOString(),
-    format: resolvedFormat,
-    ...parsed,
-    linesAnalyzed,
-  };
-  const history = addToHistory(entry);
+  addToHistory({ id, date: new Date().toISOString(), format: resolvedFormat, ...parsed, linesAnalyzed });
+  warnIfHighConfidenceFlaky();
 
-  if (parsed.failingLine) {
-    const count = history.filter((e) => e.failingLine === parsed.failingLine).length;
-    if (count >= 3) {
-      console.log(c.yellow(`⚠  This line has failed ${count} times recently — this may be a flaky test.`));
-    }
-  }
-
-  // Step 2: Locate the failing source file
   const filePath = extractFilePath(parsed.failingLine) ?? extractFilePath(parsed.why);
   if (!filePath || !fs.existsSync(path.resolve(filePath))) {
     console.log(c.dim("\nCould not locate the source file to patch."));
@@ -620,7 +689,6 @@ async function fixCommand(
     return;
   }
 
-  // Step 3: Generate patch
   process.stderr.write(c.dim("\nGenerating patch…\n\n"));
   const fileContent = fs.readFileSync(path.resolve(filePath), "utf8");
 
@@ -766,6 +834,24 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  if (args.command === "flaky") {
+    let since: Date | undefined;
+    if (args.since) {
+      since = new Date(args.since);
+      if (isNaN(since.getTime())) {
+        console.error(c.red(`Invalid date: "${args.since}". Use ISO format, e.g. 2026-05-01`));
+        process.exit(1);
+      }
+    }
+    const summaries = detectFlakyTests(loadHistory(), since);
+    if (args.jsonMode) {
+      console.log(JSON.stringify(summaries, null, 2));
+    } else {
+      displayFlakyReport(summaries);
+    }
+    process.exit(0);
+  }
+
   if (args.version) { console.log(version); process.exit(0); }
 
   if (args.help) {
@@ -786,6 +872,9 @@ async function main(): Promise<void> {
     console.log("  ci-why setup                Configure your Anthropic API key");
     console.log("  ci-why fix                  Analyse and suggest a code patch");
     console.log("  ci-why fix --dry-run        Show patch without applying it");
+    console.log("  ci-why flaky                Show flaky test report");
+    console.log("  ci-why flaky --json         Output flaky report as JSON");
+    console.log("  ci-why flaky --since <date> Only consider failures after date (e.g. 2026-05-01)");
     console.log("  ci-why history              Show last 10 analyzed failures");
     console.log("  ci-why history --show <id>  Show full details of a past failure");
     console.log("  ci-why history --clear      Clear all history");
@@ -799,6 +888,7 @@ async function main(): Promise<void> {
     console.log("  --format <fmt>      Log format: auto (default), jest, pytest, go, rust, maven");
     console.log("  --no-notify         Skip Slack notification for this run");
     console.log("  --dry-run           Show patch without applying or saving it");
+    console.log("  --since <date>      Filter history by date (ISO format)");
     console.log("  --help,    -h       Show this help message");
     console.log("  --version, -v       Print the version number");
     console.log("");
