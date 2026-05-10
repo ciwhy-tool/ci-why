@@ -2,6 +2,7 @@
 
 import * as dotenv from "dotenv";
 import * as fs from "fs";
+import * as https from "https";
 import * as os from "os";
 import * as path from "path";
 import * as readline from "readline";
@@ -28,6 +29,7 @@ type LogFormat = "auto" | "jest" | "pytest" | "go" | "rust" | "maven";
 
 interface ParsedArgs {
   command:      string | undefined;
+  subCommand:   string | undefined;
   filePath:     string | undefined;
   jsonMode:     boolean;
   format:       LogFormat;
@@ -35,10 +37,12 @@ interface ParsedArgs {
   version:      boolean;
   showId:       string | undefined;
   clearHistory: boolean;
+  noNotify:     boolean;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
   let command:      string | undefined;
+  let subCommand:   string | undefined;
   let filePath:     string | undefined;
   let jsonMode      = false;
   let format: LogFormat = "auto";
@@ -46,6 +50,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   let ver           = false;
   let showId:       string | undefined;
   let clearHistory  = false;
+  let noNotify      = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -55,15 +60,43 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === "--format" && argv[i + 1])    { format = argv[++i] as LogFormat; }
     else if (arg === "--show"   && argv[i + 1])    { showId = argv[++i]; }
     else if (arg === "--clear")                    { clearHistory = true; }
+    else if (arg === "--no-notify")                { noNotify = true; }
     else if (!arg.startsWith("-")) {
-      if (!command && !filePath) {
-        if (arg === "setup" || arg === "history") command = arg;
+      if (!command) {
+        if (arg === "setup" || arg === "history" || arg === "notify") command = arg;
         else filePath = arg;
+      } else if (!subCommand && !filePath) {
+        if (command === "notify" && (arg === "setup" || arg === "test" || arg === "clear")) {
+          subCommand = arg;
+        } else {
+          filePath = arg;
+        }
       }
     }
   }
 
-  return { command, filePath, jsonMode, format, help, version: ver, showId, clearHistory };
+  return { command, subCommand, filePath, jsonMode, format, help, version: ver, showId, clearHistory, noNotify };
+}
+
+// ─── Config file helpers ──────────────────────────────────────────────────────
+
+const CONFIG_DIR  = path.join(os.homedir(), ".config", "ci-why");
+const CONFIG_PATH = path.join(CONFIG_DIR, ".env");
+
+function readEnvFile(): Record<string, string> {
+  if (!fs.existsSync(CONFIG_PATH)) return {};
+  const result: Record<string, string> = {};
+  for (const line of fs.readFileSync(CONFIG_PATH, "utf8").split("\n")) {
+    const match = line.match(/^([^=]+)=(.*)$/);
+    if (match) result[match[1].trim()] = match[2].trim();
+  }
+  return result;
+}
+
+function writeEnvFile(entries: Record<string, string>): void {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  const content = Object.entries(entries).map(([k, v]) => `${k}=${v}`).join("\n") + "\n";
+  fs.writeFileSync(CONFIG_PATH, content, "utf8");
 }
 
 // ─── History ──────────────────────────────────────────────────────────────────
@@ -78,7 +111,7 @@ interface HistoryEntry {
   linesAnalyzed: number;
 }
 
-const HISTORY_PATH = path.join(os.homedir(), ".config", "ci-why", "history.json");
+const HISTORY_PATH = path.join(CONFIG_DIR, "history.json");
 const MAX_HISTORY  = 100;
 
 function loadHistory(): HistoryEntry[] {
@@ -91,7 +124,7 @@ function loadHistory(): HistoryEntry[] {
 }
 
 function saveHistory(entries: HistoryEntry[]): void {
-  fs.mkdirSync(path.dirname(HISTORY_PATH), { recursive: true });
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
   fs.writeFileSync(HISTORY_PATH, JSON.stringify(entries, null, 2), "utf8");
 }
 
@@ -163,6 +196,125 @@ async function clearHistoryWithConfirm(): Promise<void> {
     console.log(c.green("  History cleared."));
   } else {
     console.log(c.dim("  Cancelled."));
+  }
+}
+
+// ─── Slack ────────────────────────────────────────────────────────────────────
+
+function buildSlackMessage(
+  why: string,
+  failingLine: string,
+  suggestedFix: string,
+  fmt: string,
+): object {
+  return {
+    blocks: [
+      {
+        type: "header",
+        text: { type: "plain_text", text: "ci-why: build failure detected", emoji: false },
+      },
+      {
+        type: "section",
+        fields: [
+          { type: "mrkdwn", text: `*WHY*\n${why}` },
+          { type: "mrkdwn", text: `*FAILING LINE*\n\`${failingLine}\`` },
+        ],
+      },
+      {
+        type: "section",
+        text: { type: "mrkdwn", text: `*SUGGESTED FIX*\n${suggestedFix}` },
+      },
+      {
+        type: "context",
+        elements: [
+          { type: "mrkdwn", text: `Format: ${fmt} · ${new Date().toISOString()}` },
+        ],
+      },
+    ],
+  };
+}
+
+function postToSlack(webhookUrl: string, payload: object): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const url  = new URL(webhookUrl);
+    const req  = https.request(
+      {
+        hostname: url.hostname,
+        path:     url.pathname + url.search,
+        method:   "POST",
+        headers:  { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+      },
+      (res) => {
+        res.resume();
+        if (res.statusCode === 200) resolve();
+        else reject(new Error(`Slack webhook returned HTTP ${res.statusCode}`));
+      },
+    );
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+async function notifySetup(): Promise<void> {
+  console.log(c.bold("Slack notification setup"));
+  console.log("You need an incoming webhook URL from Slack.");
+  console.log("To create one:");
+  console.log("  1. Go to api.slack.com/apps → Create New App → From scratch");
+  console.log("  2. In your app settings, go to Incoming Webhooks and turn it on");
+  console.log("  3. Click 'Add New Webhook to Workspace', choose a channel, click Allow");
+  console.log("  4. Copy the webhook URL below\n");
+
+  const webhookUrl = await promptLine("Paste your Slack webhook URL: ");
+  if (!webhookUrl.startsWith("https://hooks.slack.com/")) {
+    console.error(c.red("Invalid webhook URL — it should start with https://hooks.slack.com/"));
+    process.exit(1);
+  }
+
+  const entries = readEnvFile();
+  entries["SLACK_WEBHOOK_URL"] = webhookUrl;
+  writeEnvFile(entries);
+
+  console.log(c.green("\nSlack notifications configured! ci-why will now post to Slack on every failure."));
+  console.log(c.dim("Test it with: ci-why notify test"));
+}
+
+async function notifyTest(): Promise<void> {
+  const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+  if (!webhookUrl) {
+    console.error(c.red("No Slack webhook configured. Run: ci-why notify setup"));
+    process.exit(1);
+  }
+  process.stdout.write(c.dim("Sending test notification… "));
+  try {
+    await postToSlack(webhookUrl, buildSlackMessage(
+      "This is a test message from ci-why",
+      "ci-why notify test",
+      "If you see this in Slack, notifications are working correctly!",
+      "test",
+    ));
+    console.log(c.green("OK"));
+  } catch (err) {
+    console.log(c.red("FAILED"));
+    console.error(c.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+}
+
+async function notifyClear(): Promise<void> {
+  const entries = readEnvFile();
+  if (!entries["SLACK_WEBHOOK_URL"]) {
+    console.log(c.dim("No Slack webhook configured."));
+    return;
+  }
+  const answer = await promptLine("Remove Slack webhook? (y/n) ");
+  if (answer.toLowerCase() === "y") {
+    delete entries["SLACK_WEBHOOK_URL"];
+    writeEnvFile(entries);
+    console.log(c.green("Slack webhook removed."));
+  } else {
+    console.log(c.dim("Cancelled."));
   }
 }
 
@@ -257,6 +409,7 @@ async function analyzeLog(
   linesAnalyzed: number,
   jsonMode: boolean,
   resolvedFormat: string,
+  noNotify: boolean,
 ): Promise<void> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -315,6 +468,18 @@ SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
       }
     }
   }
+
+  // Slack notification
+  const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+  if (!noNotify && webhookUrl) {
+    try {
+      await postToSlack(webhookUrl, buildSlackMessage(
+        parsed.why, parsed.failingLine, parsed.suggestedFix, resolvedFormat,
+      ));
+    } catch (err) {
+      process.stderr.write(c.dim(`⚠  Slack notification failed: ${(err as Error).message}\n`));
+    }
+  }
 }
 
 function displayResult(text: string): void {
@@ -350,11 +515,10 @@ async function promptForKey(): Promise<string> {
 }
 
 function saveKey(apiKey: string): void {
-  const configDir  = path.join(os.homedir(), ".config", "ci-why");
-  fs.mkdirSync(configDir, { recursive: true });
-  const configPath = path.join(configDir, ".env");
-  fs.writeFileSync(configPath, `ANTHROPIC_API_KEY=${apiKey}\n`, "utf8");
-  console.log(c.green(`\nKey saved to ${configPath}`));
+  const entries = readEnvFile();
+  entries["ANTHROPIC_API_KEY"] = apiKey;
+  writeEnvFile(entries);
+  console.log(c.green(`\nKey saved to ${CONFIG_PATH}`));
 }
 
 function printShellInstructions(apiKey: string): void {
@@ -415,6 +579,14 @@ async function main(): Promise<void> {
 
   if (args.command === "setup") { await setup(); process.exit(0); }
 
+  if (args.command === "notify") {
+    if (args.subCommand === "setup") { await notifySetup(); process.exit(0); }
+    if (args.subCommand === "test")  { await notifyTest();  process.exit(0); }
+    if (args.subCommand === "clear") { await notifyClear(); process.exit(0); }
+    console.error(c.red("Usage: ci-why notify <setup|test|clear>"));
+    process.exit(1);
+  }
+
   if (args.command === "history") {
     if (args.clearHistory) { await clearHistoryWithConfirm(); process.exit(0); }
     if (args.showId)       { showHistoryEntry(args.showId); process.exit(0); }
@@ -435,6 +607,7 @@ async function main(): Promise<void> {
     console.log("  ci-why ./build.log                  # analyze a log file");
     console.log("  ci-why --json ./build.log            # output results as JSON");
     console.log("  ci-why --format pytest ./build.log  # specify log format");
+    console.log("  ci-why --no-notify ./build.log      # skip Slack notification");
     console.log("");
     console.log("Commands:");
     console.log("  ci-why setup                Configure your Anthropic API key");
@@ -442,15 +615,20 @@ async function main(): Promise<void> {
     console.log("  ci-why history --show <id>  Show full details of a past failure");
     console.log("  ci-why history --clear      Clear all history");
     console.log("  ci-why history --json       Dump full history as JSON");
+    console.log("  ci-why notify setup         Configure Slack webhook");
+    console.log("  ci-why notify test          Send a test Slack notification");
+    console.log("  ci-why notify clear         Remove saved Slack webhook");
     console.log("");
     console.log("Options:");
     console.log("  --json              Output results as JSON instead of coloured text");
     console.log("  --format <fmt>      Log format: auto (default), jest, pytest, go, rust, maven");
+    console.log("  --no-notify         Skip Slack notification for this run");
     console.log("  --help,    -h       Show this help message");
     console.log("  --version, -v       Print the version number");
     console.log("");
     console.log("Environment:");
     console.log("  ANTHROPIC_API_KEY   Required. Get yours at console.anthropic.com");
+    console.log("  SLACK_WEBHOOK_URL   Optional. Set via: ci-why notify setup");
     process.exit(0);
   }
 
@@ -474,7 +652,7 @@ async function main(): Promise<void> {
   const chunkedLog     = chunkLog(cleanLog, resolvedFormat);
   const linesAnalyzed  = chunkedLog.split("\n").filter((l) => l.trim()).length;
 
-  await analyzeLog(chunkedLog, linesAnalyzed, args.jsonMode, resolvedFormat);
+  await analyzeLog(chunkedLog, linesAnalyzed, args.jsonMode, resolvedFormat, args.noNotify);
 }
 
 main().catch((err: Error) => {

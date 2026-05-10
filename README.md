@@ -146,6 +146,46 @@ ci-why history --clear
 
 ---
 
+## Slack notifications
+
+After every analysis, ci-why can automatically post the result to a Slack channel.
+
+**Setup:**
+
+```bash
+ci-why notify setup
+```
+
+**How to get a Slack webhook URL:**
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App → From scratch**
+2. Give it a name (e.g. "ci-why") and pick your workspace
+3. In the left sidebar click **Incoming Webhooks** and toggle it on
+4. Click **Add New Webhook to Workspace**, choose a channel, click **Allow**
+5. Copy the webhook URL and paste it when prompted
+
+**Test it:**
+
+```bash
+ci-why notify test
+```
+
+**Skip notification for a single run:**
+
+```bash
+ci-why --no-notify ./build.log
+```
+
+**Remove the webhook:**
+
+```bash
+ci-why notify clear
+```
+
+The Slack message includes the failure cause, failing line, suggested fix, detected log format, and timestamp.
+
+---
+
 ## GitHub Actions integration
 
 Add `ci-why` to any existing workflow to automatically post a plain-English explanation of build failures as a PR comment.
