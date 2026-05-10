@@ -103,6 +103,49 @@ ci-why --json ./build.log
 
 ---
 
+## Failure history
+
+Every analysis is automatically saved to `~/.config/ci-why/history.json`.
+
+**Show last 10 failures:**
+
+```bash
+ci-why history
+```
+
+```
+  ID       DATE          FORMAT   WHY
+  ──────────────────────────────────────────────────────────────────────────
+  a3f9bc   May 11 14:22  jest     Missing peer dependency — react@^18 is req…
+  d72e01   May 10 09:15  pytest   AssertionError: expected 200 but got 401
+```
+
+**Show full details of a past failure:**
+
+```bash
+ci-why history --show a3f9bc
+```
+
+**Dump full history as JSON:**
+
+```bash
+ci-why history --json
+```
+
+**Clear history:**
+
+```bash
+ci-why history --clear
+```
+
+**Flaky test detection:** If the same failing line appears 3 or more times in your history, ci-why will warn you:
+
+```
+⚠  This line has failed 4 times recently — this may be a flaky test.
+```
+
+---
+
 ## GitHub Actions integration
 
 Add `ci-why` to any existing workflow to automatically post a plain-English explanation of build failures as a PR comment.
@@ -121,7 +164,7 @@ steps:
 
   - name: Explain failure with ci-why
     if: steps.build.outcome == 'failure'
-    uses: ciwhy-tool/ci-why@v0.2.0
+    uses: ciwhy-tool/ci-why@v0.3.0
     with:
       log-file: /tmp/build.log
       anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}

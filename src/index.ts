@@ -27,21 +27,25 @@ const c = {
 type LogFormat = "auto" | "jest" | "pytest" | "go" | "rust" | "maven";
 
 interface ParsedArgs {
-  command:  string | undefined;
-  filePath: string | undefined;
-  jsonMode: boolean;
-  format:   LogFormat;
-  help:     boolean;
-  version:  boolean;
+  command:      string | undefined;
+  filePath:     string | undefined;
+  jsonMode:     boolean;
+  format:       LogFormat;
+  help:         boolean;
+  version:      boolean;
+  showId:       string | undefined;
+  clearHistory: boolean;
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
-  let command:  string | undefined;
-  let filePath: string | undefined;
-  let jsonMode  = false;
+  let command:      string | undefined;
+  let filePath:     string | undefined;
+  let jsonMode      = false;
   let format: LogFormat = "auto";
-  let help    = false;
-  let ver     = false;
+  let help          = false;
+  let ver           = false;
+  let showId:       string | undefined;
+  let clearHistory  = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -49,16 +53,117 @@ function parseArgs(argv: string[]): ParsedArgs {
     else if (arg === "--help"  || arg === "-h")    { help = true; }
     else if (arg === "--version" || arg === "-v")  { ver = true; }
     else if (arg === "--format" && argv[i + 1])    { format = argv[++i] as LogFormat; }
+    else if (arg === "--show"   && argv[i + 1])    { showId = argv[++i]; }
+    else if (arg === "--clear")                    { clearHistory = true; }
     else if (!arg.startsWith("-")) {
-      // First bare word is a subcommand (setup), subsequent ones are file paths
       if (!command && !filePath) {
-        if (arg === "setup") command = arg;
+        if (arg === "setup" || arg === "history") command = arg;
         else filePath = arg;
       }
     }
   }
 
-  return { command, filePath, jsonMode, format, help, version: ver };
+  return { command, filePath, jsonMode, format, help, version: ver, showId, clearHistory };
+}
+
+// ─── History ──────────────────────────────────────────────────────────────────
+
+interface HistoryEntry {
+  id:            string;
+  date:          string;
+  format:        string;
+  why:           string;
+  failingLine:   string;
+  suggestedFix:  string;
+  linesAnalyzed: number;
+}
+
+const HISTORY_PATH = path.join(os.homedir(), ".config", "ci-why", "history.json");
+const MAX_HISTORY  = 100;
+
+function loadHistory(): HistoryEntry[] {
+  try {
+    if (!fs.existsSync(HISTORY_PATH)) return [];
+    return JSON.parse(fs.readFileSync(HISTORY_PATH, "utf8")) as HistoryEntry[];
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory(entries: HistoryEntry[]): void {
+  fs.mkdirSync(path.dirname(HISTORY_PATH), { recursive: true });
+  fs.writeFileSync(HISTORY_PATH, JSON.stringify(entries, null, 2), "utf8");
+}
+
+function addToHistory(entry: HistoryEntry): HistoryEntry[] {
+  const history = loadHistory();
+  history.unshift(entry);
+  if (history.length > MAX_HISTORY) history.splice(MAX_HISTORY);
+  saveHistory(history);
+  return history;
+}
+
+function generateId(): string {
+  return Math.random().toString(36).slice(2, 8);
+}
+
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  const mon = d.toLocaleString("en-US", { month: "short" });
+  const day = String(d.getDate()).padStart(2, "0");
+  const hh  = String(d.getHours()).padStart(2, "0");
+  const mm  = String(d.getMinutes()).padStart(2, "0");
+  return `${mon} ${day} ${hh}:${mm}`;
+}
+
+function showHistoryTable(): void {
+  const history = loadHistory();
+  if (history.length === 0) {
+    console.log(c.dim("  No history yet."));
+    return;
+  }
+  const entries = history.slice(0, 10);
+  console.log(c.bold(`  ${"ID".padEnd(8)} ${"DATE".padEnd(13)} ${"FORMAT".padEnd(8)} WHY`));
+  console.log(c.dim("  " + "─".repeat(72)));
+  for (const entry of entries) {
+    const why = entry.why.length > 44 ? entry.why.slice(0, 41) + "…" : entry.why;
+    console.log(`  ${c.dim(entry.id.padEnd(8))} ${formatDate(entry.date).padEnd(13)} ${entry.format.padEnd(8)} ${why}`);
+  }
+  if (history.length > 10) {
+    console.log(c.dim(`\n  (${history.length - 10} more — use: ci-why history --json)`));
+  }
+}
+
+function showHistoryEntry(id: string): void {
+  const history = loadHistory();
+  const entry   = history.find((e) => e.id === id);
+  if (!entry) {
+    console.error(c.red(`Error: no history entry with id "${id}"`));
+    process.exit(1);
+  }
+  const divider = c.dim("─".repeat(50));
+  console.log(divider);
+  console.log(c.dim(`  ${entry.date}  ·  ${entry.format}  ·  ${entry.linesAnalyzed} lines analyzed`));
+  console.log();
+  console.log(c.bold(c.red("  WHY")));            console.log(`  ${entry.why}\n`);
+  console.log(c.bold(c.yellow("  FAILING LINE"))); console.log(`  ${entry.failingLine}\n`);
+  console.log(c.bold(c.green("  SUGGESTED FIX"))); console.log(`  ${entry.suggestedFix}\n`);
+  console.log(divider);
+}
+
+async function clearHistoryWithConfirm(): Promise<void> {
+  const history = loadHistory();
+  if (history.length === 0) {
+    console.log(c.dim("  History is already empty."));
+    return;
+  }
+  const answer = await promptLine(`Clear ${history.length} history entries? (y/n) `);
+  if (answer.toLowerCase() === "y") {
+    saveHistory([]);
+    console.log(c.green("  History cleared."));
+  } else {
+    console.log(c.dim("  Cancelled."));
+  }
 }
 
 // ─── Log format detection & chunking ─────────────────────────────────────────
@@ -72,9 +177,9 @@ const FORMAT_PATTERNS: Record<Exclude<LogFormat, "auto">, RegExp> = {
 };
 
 function detectFormat(text: string): Exclude<LogFormat, "auto"> {
-  if (/error\[E\d+\]|thread '.*' panicked/.test(text))       return "rust";
-  if (/^--- FAIL:|^panic:/m.test(text))                       return "go";
-  if (/^FAILED .+::|AssertionError|^={20,}/m.test(text))     return "pytest";
+  if (/error\[E\d+\]|thread '.*' panicked/.test(text))        return "rust";
+  if (/^--- FAIL:|^panic:/m.test(text))                        return "go";
+  if (/^FAILED .+::|AssertionError|^={20,}/m.test(text))      return "pytest";
   if (/BUILD FAILURE|BUILD FAILED|\[ERROR\]|\[FATAL\]/.test(text)) return "maven";
   return "jest";
 }
@@ -133,16 +238,16 @@ async function readInput(filePath?: string): Promise<string> {
 const MODEL = "claude-haiku-4-5-20251001";
 
 interface AnalysisResult {
-  why:          string;
-  failingLine:  string;
-  suggestedFix: string;
+  why:           string;
+  failingLine:   string;
+  suggestedFix:  string;
   linesAnalyzed: number;
-  model:        string;
+  model:         string;
 }
 
 function parseResponse(text: string): Omit<AnalysisResult, "linesAnalyzed" | "model"> {
-  const why         = text.match(/WHY:\s*(.+?)(?=\nFAILING LINE:|$)/s)?.[1]?.trim() ?? "";
-  const failingLine = text.match(/FAILING LINE:\s*(.+?)(?=\nSUGGESTED FIX:|$)/s)?.[1]?.trim() ?? "";
+  const why          = text.match(/WHY:\s*(.+?)(?=\nFAILING LINE:|$)/s)?.[1]?.trim() ?? "";
+  const failingLine  = text.match(/FAILING LINE:\s*(.+?)(?=\nSUGGESTED FIX:|$)/s)?.[1]?.trim() ?? "";
   const suggestedFix = text.match(/SUGGESTED FIX:\s*(.+?)$/s)?.[1]?.trim() ?? "";
   return { why, failingLine, suggestedFix };
 }
@@ -151,6 +256,7 @@ async function analyzeLog(
   log: string,
   linesAnalyzed: number,
   jsonMode: boolean,
+  resolvedFormat: string,
 ): Promise<void> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
@@ -183,15 +289,31 @@ SUGGESTED FIX: <one actionable step the developer can take to fix it>`;
     .map((block) => block.text)
     .join("");
 
+  const parsed = parseResponse(text);
+
+  // Save to history
+  const entry: HistoryEntry = {
+    id: generateId(),
+    date: new Date().toISOString(),
+    format: resolvedFormat,
+    ...parsed,
+    linesAnalyzed,
+  };
+  const history = addToHistory(entry);
+
   if (jsonMode) {
-    const result: AnalysisResult = {
-      ...parseResponse(text),
-      linesAnalyzed,
-      model: MODEL,
-    };
+    const result: AnalysisResult = { ...parsed, linesAnalyzed, model: MODEL };
     console.log(JSON.stringify(result, null, 2));
   } else {
     displayResult(text);
+
+    // Flaky test warning
+    if (parsed.failingLine) {
+      const count = history.filter((e) => e.failingLine === parsed.failingLine).length;
+      if (count >= 3) {
+        console.log(c.yellow(`⚠  This line has failed ${count} times recently — this may be a flaky test.`));
+      }
+    }
   }
 }
 
@@ -201,7 +323,7 @@ function displayResult(text: string): void {
 
   console.log(divider);
 
-  if (why)          { console.log(c.bold(c.red("  WHY")));           console.log(`  ${why}\n`); }
+  if (why)          { console.log(c.bold(c.red("  WHY")));            console.log(`  ${why}\n`); }
   if (failingLine)  { console.log(c.bold(c.yellow("  FAILING LINE"))); console.log(`  ${failingLine}\n`); }
   if (suggestedFix) { console.log(c.bold(c.green("  SUGGESTED FIX"))); console.log(`  ${suggestedFix}\n`); }
 
@@ -293,6 +415,14 @@ async function main(): Promise<void> {
 
   if (args.command === "setup") { await setup(); process.exit(0); }
 
+  if (args.command === "history") {
+    if (args.clearHistory) { await clearHistoryWithConfirm(); process.exit(0); }
+    if (args.showId)       { showHistoryEntry(args.showId); process.exit(0); }
+    if (args.jsonMode)     { console.log(JSON.stringify(loadHistory(), null, 2)); process.exit(0); }
+    showHistoryTable();
+    process.exit(0);
+  }
+
   if (args.version) { console.log(version); process.exit(0); }
 
   if (args.help) {
@@ -307,7 +437,11 @@ async function main(): Promise<void> {
     console.log("  ci-why --format pytest ./build.log  # specify log format");
     console.log("");
     console.log("Commands:");
-    console.log("  ci-why setup        Configure your Anthropic API key");
+    console.log("  ci-why setup                Configure your Anthropic API key");
+    console.log("  ci-why history              Show last 10 analyzed failures");
+    console.log("  ci-why history --show <id>  Show full details of a past failure");
+    console.log("  ci-why history --clear      Clear all history");
+    console.log("  ci-why history --json       Dump full history as JSON");
     console.log("");
     console.log("Options:");
     console.log("  --json              Output results as JSON instead of coloured text");
@@ -340,7 +474,7 @@ async function main(): Promise<void> {
   const chunkedLog     = chunkLog(cleanLog, resolvedFormat);
   const linesAnalyzed  = chunkedLog.split("\n").filter((l) => l.trim()).length;
 
-  await analyzeLog(chunkedLog, linesAnalyzed, args.jsonMode);
+  await analyzeLog(chunkedLog, linesAnalyzed, args.jsonMode, resolvedFormat);
 }
 
 main().catch((err: Error) => {

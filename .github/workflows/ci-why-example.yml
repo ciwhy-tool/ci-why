@@ -37,7 +37,7 @@ jobs:
       # Only runs when the build step above failed.
       - name: Explain failure with ci-why
         if: steps.build.outcome == 'failure'
-        uses: ciwhy-tool/ci-why@v0.2.0
+        uses: ciwhy-tool/ci-why@v0.3.0
         with:
           log-file: /tmp/build.log
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
