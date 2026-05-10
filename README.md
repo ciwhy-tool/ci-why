@@ -234,6 +234,60 @@ ci-why history --clear
 
 ---
 
+## Choosing your AI provider
+
+ci-why supports three AI backends. Run `ci-why setup` to configure your preferred one, or switch per-run with `--model`.
+
+### Anthropic (default, recommended)
+
+Cloud-based. Requires a free API key from [console.anthropic.com](https://console.anthropic.com/).
+
+```bash
+ci-why setup   # choose option 1
+# or
+export ANTHROPIC_API_KEY=your-key-here
+```
+
+```bash
+ci-why --model anthropic:claude-haiku ./build.log   # fast, default
+ci-why --model anthropic:claude-sonnet ./build.log  # smarter
+```
+
+### Ollama — fully offline and free
+
+Runs entirely on your machine. No API key, no data sent anywhere.
+
+```bash
+# Install Ollama from ollama.com, then:
+ollama serve
+ollama pull llama3
+
+ci-why --model ollama:llama3 ./build.log
+ci-why --model ollama:mistral ./build.log
+```
+
+Run `ci-why setup` and choose option 2 to make Ollama the default.
+
+### OpenAI
+
+Cloud-based. Requires an API key from [platform.openai.com](https://platform.openai.com/).
+
+```bash
+export OPENAI_API_KEY=your-key-here
+ci-why --model openai:gpt-4o ./build.log
+ci-why --model openai:gpt-4o-mini ./build.log
+```
+
+### List available models
+
+```bash
+ci-why models
+```
+
+Shows all Anthropic and OpenAI options, plus any Ollama models currently pulled on your machine.
+
+---
+
 ## Slack notifications
 
 After every analysis, ci-why can automatically post the result to a Slack channel.
